@@ -52,7 +52,7 @@ import json
 from functools import reduce
 
 def export_scenejson(class_name, mesh):
-    """Exports the current mesh as a JSON model.
+    """DEPRECATED Exports the current mesh as a JSON model.
 
     Developed by johnvillarzavatti [at] gmail [dot] com
 
@@ -267,26 +267,6 @@ def export_objectJson(ob, me, scene):
 def object_to_dict(scene, object, binary=False):
     outp = {'name': object.name}
     
-    armature = object.find_armature()
-    if armature is not None:
-        # Put the armature in REST position
-        armature_proper = bpy.data.armatures[armature.name]
-        #armature.pose_position = 'REST'
-        
-    # Convert all the mesh's faces to triangles
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='SELECT')
-    bpy.ops.mesh.quads_convert_to_tris()
-    bpy.context.scene.update()
-    bpy.ops.object.mode_set(mode='OBJECT') # set it in object
-    
-    me = object.to_mesh(scene, True, "PREVIEW")
-    reduce(lambda x,y: max(x,y), [grp.group for v in me.vertices for grp in v.groups])
-    ome = {}
-    
-    numverts = len(me.vertices)
-    numfaces = len(me.faces)
-    
     # Binary mode packs everything as 16-bit fixed point big-endian arrays, 
     # taking the absolute value of the floating point original value, the first
     # 8 bits are the decimal part, last 8 bits are the integral part and then
@@ -295,13 +275,18 @@ def object_to_dict(scene, object, binary=False):
     # it by 8192.0f (keeps sign). Vertex groups are packed with the 10 less
     # significative bits taking the weight in the range (0 <= weight <= 1)*1023
     # and the 6 most significative bits as the vertex group. Each group is
-    # preceded by a byte specifying how much groups follow it.
-    # Everything gets Base64 encoded in binary mode.
-    # Think of JSON as a binary-safe transport in this mode.
+    # preceded by a byte specifying how much groups follow it. Bones
+    # Everything gets Base64 encoded in binary mode. Bones are exported as only
+    # unit Quaternions (because we only need rotations) and the coefficients are
+    # the long integer representation of the unit scalar times 2**31 or more
+    # explicitly 0x7FFFFFFF.
+    # Think of JSON as a binary-safe transport in this mode. Everything is
+    # stored big-endian.
     #
     # Normal mode is the least efficient space-wise but is far more readable.
     #
-    # Arrays are 'flattened' in both cases.
+    # Arrays are 'flattened' in both cases. Most "lengths" must be computed from
+    # the arrays' lengths divided by the expected primitives' lengths.
     if binary:
         fixed_proc = lambda x: to_fixed16(x)
         fixed_pack = lambda arr: base64.encodebytes(struct.pack(">%dh" % len(arr), *arr)).decode('ascii')[:-1]
@@ -312,6 +297,10 @@ def object_to_dict(scene, object, binary=False):
         v_uv_pack = fixed_pack
         v_bw_proc = lambda x: ((x[0] & 63) << 10) | (int(x[1] * 1023.0) & 1023)
         v_bw_pack = lambda x: base64.encodebytes(bytes().join([struct.pack(">B%iH" % len(y), len(y), *y) for y in x])).decode('ascii')[:-1]
+        bo_quat_proc = lambda x: int(x * 0x7FFFFFFF)
+        bo_quat_pack = lambda x: base64.encodebytes(struct.pack(">%il" % len(x), *x)).decode('ascii')[:-1]
+        anim_proc = fixed_proc
+        anim_pack = fixed_pack
     else:
         identity = lambda i: i
         v_co_proc, v_co_pack = identity, identity
@@ -319,34 +308,102 @@ def object_to_dict(scene, object, binary=False):
         v_face_pack = identity
         v_uv_proc, v_uv_pack = identity, identity
         v_bw_proc, v_bw_pack = identity, identity
+        bo_quat_proc, bo_quat_pack = identity, identity
+        anim_proc, anim_pack = identity, identity
+    
+    if object.type == 'MESH':
+        armature = object.find_armature()
+        if armature is not None:
+            # Put the armature in REST position
+            armature_proper = bpy.data.armatures[armature.name]
+            #armature.pose_position = 'REST'
+            
+        # Convert all the mesh's faces to triangles
+        #bpy.ops.object.select_name(object.name)
+        object.select = True
+        bpy.context.scene.objects.active = object
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode='EDIT')
+        else:
+            raise "Can't set edit mode for '%s'" % object.name
+            
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.quads_convert_to_tris()
+        bpy.context.scene.update()
         
-    ome['v'] = v_co_pack([v_co_proc(ax) for v in me.vertices for ax in v.co])
-    ome['n'] = v_normal_pack([v_normal_proc(ax) for v in me.vertices for ax in v.normal])
-    ome['f'] = v_face_pack([idx for f in me.faces for idx in f.vertices])
-    
-    ome['uv'] = []
-    for layer in me.uv_textures:
-        ome['uv'].append(v_uv_pack([v_uv_proc(st) for tex_face in layer.data for uv in tex_face.uv for st in uv]))
-    
-    if armature is not None:
-        ome['bw'] = v_bw_pack([[v_bw_proc((grp.group, grp.weight)) for grp in v.groups] for v in me.vertices])
+        bpy.ops.object.mode_set(mode='OBJECT') # set it in object
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode='OBJECT') # set it in object
+        else:
+            raise "Can't set object mode for '%s'" % object.name
 
-        # Put the armature in POSE position
-        #armature.pose_position = 'POSE'
+        object.select = False
         
-        #ome['b'] =
-    else:
-        # Export vertex animations
-        pass
+        me = object.to_mesh(scene, True, "PREVIEW")
+        #reduce(lambda x,y: max(x,y), [grp.group for v in me.vertices for grp in v.groups])
+        ome = {}
         
-    outp['mesh'] = ome
+        numverts = len(me.vertices)
+        numfaces = len(me.faces)
+        
+        ome['v'] = v_co_pack([v_co_proc(ax) for v in me.vertices for ax in v.co])
+        ome['n'] = v_normal_pack([v_normal_proc(ax) for v in me.vertices for ax in v.normal])
+        ome['f'] = v_face_pack([idx for f in me.faces for idx in f.vertices])
+        
+        ome['uv'] = []
+        for layer in me.uv_textures:
+            ome['uv'].append(v_uv_pack([v_uv_proc(st) for tex_face in layer.data for uv in tex_face.uv for st in uv]))
+        
+        if armature is not None:
+            ome['bw'] = v_bw_pack([[v_bw_proc((grp.group, grp.weight)) for grp in v.groups] for v in me.vertices])
+
+            quats = []
+            for frame in range(scene.frame_start, scene.frame_end + 1):
+                scene.frame_set(frame)
+                quats.append(bo_quat_pack([bo_quat_proc(qv) for bone in armature.pose.bones for qv in bone.matrix.to_quaternion()]))
+                
+            ome['bq'] = quats
+        else:
+            # Export vertex animations
+            pass
+            
+        def flatten_texture_slot(ts):
+            res = {'tex': ts.texture.image.filepath.split("\\")[-1]}
+            
+            return res
+            
+        ome['mats'] = [flatten_texture_slot(ts) for mat in object.material_slots for ts in mat.material.texture_slots if ts is not None and ts.texture.type == 'IMAGE']
+            
+        outp['mesh'] = ome
+    elif object.type == 'CAMERA':
+        cam = bpy.data.cameras[object.name]
+        outp['clip'] = [cam.clip_start, cam.clip_end]
+        outp['proy'] = cam.type
+        if cam.type == 'PERSP':
+            cam.lens_unit = 'DEGREES'
+            outp['fov'] = cam.angle
+        elif cam.type == 'ORTHO':
+            outp['cam_scale'] = cam.ortho_scale
+    
+    if object.animation_data is not None:
+        crvs = {"%s_%s" % (crv.data_path[0:3], ['x','y','z'][crv.array_index]): crv for crv in object.animation_data.action.fcurves}
+        outp['anim'] = {crv: anim_pack([anim_proc(crvs[crv].evaluate(f)) for f in range(scene.frame_start, scene.frame_end+1)]) for crv in crvs}
     
     return outp
     
 def export_scene_json(scene, binary=False):
-    outp = {'scene': scene.name, 'fps': scene.render.fps}
+    outp = {'scene': scene.name, 'fps': scene.render.fps, 'num_frames': scene.frame_end - scene.frame_start}
     
-    outp['objs'] = [object_to_dict(scene, obj, binary) for obj in scene.objects if (obj.type == 'MESH') and (obj.select)]
+    #outp['objs'] = [object_to_dict(scene, obj, binary) for obj in scene.objects if (obj.type == 'MESH') and (obj.select)]
+    outp['objs'] = [object_to_dict(scene, obj, binary) for obj in scene.objects]
+    
+    # secuencias
+    # si scene.sequence_editor.sequences[0].type == 'AUDIO' entonces
+    # scene.sequence_editor.sequences[0].filepath.split("\\")[-1]
+    # scene.timeline_markers
+    #{"%s_%s" % (crv.data_path, ['x','y','z'][crv.array_index]): crv for crv in bpy.data.objects[1].animation_data.action.fcurves}
+    
+    #{crv: [crvs[crv].evaluate(f) for f in range(sce.frame_start, sce.frame_end+1)] for crv in crvs}
     
     return json.dumps(outp)
 
