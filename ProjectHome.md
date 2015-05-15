@@ -1,0 +1,1 @@
+This project adds JSON export capabilities to Blender. Forked off the great blender-webgl-exporter project.
